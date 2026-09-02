@@ -812,9 +812,23 @@ def check_student_session(
     else:
         # No teacher assigned — fall back to any active session so demo works out of the box
         sess = db.query(ClassSession).filter_by(is_active=True).first()
-    if sess:
-        return {"active": True, "session_code": sess.session_code}
-    return {"active": False}
+        tid = sess.teacher_id if sess else None
+
+    if not sess:
+        return {"active": False}
+
+    # Resolve teacher's display name so the frontend doesn't have to guess
+    # field names or fall back to a generic "Teacher" placeholder.
+    teacher_name = "Teacher"
+    tp = db.query(TeacherProfile).filter_by(id=tid).first() if tid else None
+    if tp:
+        teacher_name = (
+            tp.display_name
+            or f"{tp.first_name} {tp.last_name}".strip()
+            or (tp.user.username if tp.user else "Teacher")
+        )
+
+    return {"active": True, "session_code": sess.session_code, "teacher_name": teacher_name}
 
 
 # ─────────────────────────────────────────────
@@ -905,12 +919,18 @@ async def broadcast_audio(
 
 # ─────────────────────────────────────────────
 # 9. CAPTION POLLING  (both teacher feed + student feed)
-# Students call this every 1.5 s with ?since=<last_id>
+# Students AND teacher call this to get a merged, time-ordered feed of
+# teacher captions (CCMessage) + student AAC taps (AACLog) for the current
+# active session.
+#
+# `since` is an ISO timestamp cursor (not an id) so both tables can share
+# one ordering. Each returned item's `id` is a prefixed string ("cc-12" /
+# "aac-7") to keep them unique across both source tables.
 # ─────────────────────────────────────────────
 
 @app.get("/api/cc/messages/")
 def get_cc_messages(
-    since: int = 0,
+    since: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -925,17 +945,21 @@ def get_cc_messages(
             tid = sess.teacher_id if sess else None
         if not sess:
             return []
-        # Scope to current session only so old sessions don't bleed in
-        msgs = (
-            db.query(CCMessage)
-            .filter(
-                CCMessage.teacher_id == tid,
-                CCMessage.id > since,
-                CCMessage.sent_at >= sess.started_at,
-            )
-            .order_by(CCMessage.id.asc())
-            .limit(30)
-            .all()
+
+        cc_q = db.query(CCMessage).filter(
+            CCMessage.teacher_id == tid,
+            CCMessage.session_id == sess.id,
+        )
+        # Include every classmate's taps (not just this student's own), so
+        # everyone sees the same shared feed. Falls back to just this
+        # student if there's no roster info yet.
+        classmate_ids = [
+            s.user_id for s in
+            db.query(StudentProfile).filter_by(instructor_id=tid).all()
+        ] or [current_user.id]
+        aac_q = db.query(AACLog).filter(
+            AACLog.session_id == sess.id,
+            AACLog.user_id.in_(classmate_ids),
         )
     else:
         # Teacher live-room: scope to current active session only
@@ -943,29 +967,51 @@ def get_cc_messages(
         sess = db.query(ClassSession).filter_by(teacher_id=tp.id, is_active=True).first()
         if not sess:
             return []
-        msgs = (
-            db.query(CCMessage)
-            .filter(
-                CCMessage.teacher_id == tp.id,
-                CCMessage.id > since,
-                CCMessage.sent_at >= sess.started_at,
-            )
-            .order_by(CCMessage.id.asc())
-            .limit(30)
-            .all()
+        cc_q = db.query(CCMessage).filter(
+            CCMessage.teacher_id == tp.id,
+            CCMessage.session_id == sess.id,
+        )
+        student_ids = [s.user_id for s in tp.students]
+        aac_q = (
+            db.query(AACLog).filter(AACLog.session_id == sess.id, AACLog.user_id.in_(student_ids))
+            if student_ids else db.query(AACLog).filter(AACLog.id < 0)  # empty result
         )
 
-    return [
-        {"id": m.id, "text": m.text, "speaker": m.speaker, "sent_at": m.sent_at}
-        for m in msgs
-    ]
+    if since:
+        cc_q  = cc_q.filter(CCMessage.sent_at > since)
+        aac_q = aac_q.filter(AACLog.tapped_at > since)
+
+    cc_msgs  = cc_q.order_by(CCMessage.sent_at.asc()).limit(30).all()
+    aac_logs = aac_q.order_by(AACLog.tapped_at.asc()).limit(30).all()
+
+    aac_user_ids = list({l.user_id for l in aac_logs})
+    name_map = _build_student_name_map(db, aac_user_ids) if aac_user_ids else {}
+
+    items = []
+    for m in cc_msgs:
+        items.append({
+            "id":          f"cc-{m.id}",
+            "text":        m.text,
+            "speaker":     "teacher",
+            "sender_name": "Teacher",
+            "sent_at":     m.sent_at,
+        })
+    for l in aac_logs:
+        items.append({
+            "id":          f"aac-{l.id}",
+            "text":        l.message or l.icon_label,
+            "speaker":     "student",
+            "sender_name": name_map.get(l.user_id, f"Student #{l.user_id}"),
+            "sent_at":     l.tapped_at,
+        })
+
+    items.sort(key=lambda x: x["sent_at"])
+    return items[:40]
 
 
 # ─────────────────────────────────────────────
 # 10. DIRECT MESSAGES
 # ─────────────────────────────────────────────
-
-# Messages removed — communication is now via AAC Board → Session Logs → Live CC
 
 
 # ─────────────────────────────────────────────
