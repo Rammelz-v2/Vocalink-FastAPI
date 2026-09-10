@@ -357,11 +357,12 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Password hashing failed: {str(e)}")
 
     user = User(
-        username        = data.username,
-        email           = str(data.email),
-        hashed_password = hashed_pw,
-        status          = data.status,
-    )
+    username        = data.username,
+    email           = str(data.email),
+    hashed_password = hashed_pw,
+    status          = data.status,
+    is_verified     = 1,   # skip email verification entirely
+)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -539,8 +540,6 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     ).first()
     if not user or not pwd_context.verify(data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    if not user.is_verified:  # works for both 0 and False
-        raise HTTPException(status_code=403, detail="EMAIL_NOT_VERIFIED")
     return {"access_token": create_access_token({"user_id": user.id}), "status": user.status}
 
 # ─────────────────────────────────────────────
