@@ -1098,6 +1098,44 @@ def log_icon_tap(data: AACLogSchema, db: Session = Depends(get_db), current_user
     return {"message": "Log saved"}
 
 
+@app.post("/api/sessions/log/")
+def log_to_session(
+    data: SessionLogSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Called by the mobile AAC board when a student sends a built message
+    while a session is active. Verifies the session_code matches the
+    student's assigned teacher's *currently active* session before logging,
+    so a stale or mismatched code can't attribute a tap to the wrong class.
+    """
+    if current_user.status != "STUDENT":
+        raise HTTPException(status_code=403, detail="Students only")
+
+    sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
+    tid = sp.instructor_id if sp else None
+    if not tid:
+        raise HTTPException(status_code=403, detail="Not assigned to a teacher")
+
+    sess = db.query(ClassSession).filter_by(
+        teacher_id=tid, session_code=data.session_code, is_active=True
+    ).first()
+    if not sess:
+        raise HTTPException(status_code=400, detail="Session not found or no longer active")
+
+    db.add(AACLog(
+        user_id    = current_user.id,
+        session_id = sess.id,
+        icon_id    = data.icon_id,
+        icon_label = data.icon_label,
+        message    = data.icon_label,
+        tapped_at  = dt.datetime.utcnow().isoformat(),
+    ))
+    db.commit()
+    return {"message": "Logged to session"}
+
+
 @app.get("/api/logs/")
 def get_logs(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     logs = db.query(AACLog).filter_by(user_id=current_user.id).order_by(AACLog.id.desc()).limit(50).all()
