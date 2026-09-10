@@ -356,13 +356,15 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Password hashing failed: {str(e)}")
 
+    # Email verification is disabled — new accounts are verified immediately
+    # so they can log in right after signing up.
     user = User(
-    username        = data.username,
-    email           = str(data.email),
-    hashed_password = hashed_pw,
-    status          = data.status,
-    is_verified     = 1,   # skip email verification entirely
-)
+        username        = data.username,
+        email           = str(data.email),
+        hashed_password = hashed_pw,
+        status          = data.status,
+        is_verified     = 1,
+    )
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -379,24 +381,9 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
         db.rollback()
         print(f"[register] profile warning: {e}")
 
-    # Send verification email
-    code = str(random.randint(100000, 999999))
-    expires = dt.datetime.utcnow() + dt.timedelta(minutes=30)
-    db.query(OTPToken).filter(OTPToken.email == user.email).delete()
-    db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
-    db.commit()
-    print(f"[VERIFY CODE] {user.email} → {code}")
-    email_sent, email_error = _send_otp_via_brevo(user.email, code)
-    if email_sent:
-        print(f"[BREVO] Sent to {user.email}")
-    else:
-        print(f"[BREVO] Failed: {email_error}")
-
     return {
-        "message": "Account created! Check your email for a verification code.",
+        "message": "Account created! You can now sign in.",
         "email": user.email,
-        "email_sent": email_sent,
-        "email_error": email_error,
     }
 
 @app.get("/api/auth/test-brevo/")
@@ -801,25 +788,25 @@ def check_student_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Student polls this every 5 s on home screen to detect when class starts."""
+    """Student polls this every 5 s on home screen to detect when class starts.
+    Only returns a session if the student has been assigned to that teacher —
+    no more falling back to 'any active session'.
+    """
     if current_user.status != "STUDENT":
         return {"active": False}
     sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
     tid = sp.instructor_id if sp else None
-    if tid:
-        sess = db.query(ClassSession).filter_by(teacher_id=tid, is_active=True).first()
-    else:
-        # No teacher assigned — fall back to any active session so demo works out of the box
-        sess = db.query(ClassSession).filter_by(is_active=True).first()
-        tid = sess.teacher_id if sess else None
+    if not tid:
+        return {"active": False}  # not assigned to a teacher yet
 
+    sess = db.query(ClassSession).filter_by(teacher_id=tid, is_active=True).first()
     if not sess:
         return {"active": False}
 
     # Resolve teacher's display name so the frontend doesn't have to guess
     # field names or fall back to a generic "Teacher" placeholder.
     teacher_name = "Teacher"
-    tp = db.query(TeacherProfile).filter_by(id=tid).first() if tid else None
+    tp = db.query(TeacherProfile).filter_by(id=tid).first()
     if tp:
         teacher_name = (
             tp.display_name
@@ -936,12 +923,10 @@ def get_cc_messages(
     if current_user.status == "STUDENT":
         sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
         tid = sp.instructor_id if sp else None
-        if tid:
-            sess = db.query(ClassSession).filter_by(teacher_id=tid, is_active=True).first()
-        else:
-            # No teacher assigned — fall back to any active session so demo works out of the box
-            sess = db.query(ClassSession).filter_by(is_active=True).first()
-            tid = sess.teacher_id if sess else None
+        if not tid:
+            return []  # not assigned to a teacher — nothing to show
+
+        sess = db.query(ClassSession).filter_by(teacher_id=tid, is_active=True).first()
         if not sess:
             return []
 
