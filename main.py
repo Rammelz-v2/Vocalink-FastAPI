@@ -186,11 +186,24 @@ class AACLog(Base):
     message    = Column(String, nullable=True)
     tapped_at  = Column(String, default=lambda: dt.datetime.utcnow().isoformat())
 
+class CommunicationRequest(Base):
+    __tablename__ = "communication_requests"
+    id           = Column(Integer, primary_key=True, index=True)
+    student_id   = Column(Integer, ForeignKey("student_profiles.id", ondelete="CASCADE"))
+    session_id   = Column(Integer, ForeignKey("class_sessions.id", ondelete="SET NULL"), nullable=True)
+    request_type = Column(String)   # "medication" | "bathroom" | "assistance"
+    status       = Column(String, default="pending")  # pending | acknowledged | resolved
+    note         = Column(String, nullable=True)
+    created_at   = Column(String, default=lambda: dt.datetime.utcnow().isoformat())
+    resolved_at  = Column(String, nullable=True)
+
+    student = relationship("StudentProfile")
 
 Base.metadata.create_all(bind=engine)
 
 # ── Safe auto-migrations for existing DBs ────────────────────────────────────
 _migrations = [
+    ("communication_requests", "resolved_at VARCHAR"),
     ("users",            "is_verified INTEGER DEFAULT 0"),
     ("student_profiles", "last_seen VARCHAR"),
     ("teacher_profiles", "first_name VARCHAR DEFAULT ''"),
@@ -289,6 +302,13 @@ class AACLogSchema(BaseModel):
     icon_id:    str
     icon_label: str
     message:    Optional[str] = None
+
+class RequestCreateSchema(BaseModel):
+    request_type: str
+    note: Optional[str] = None
+
+class RequestStatusSchema(BaseModel):
+    status: str
 
 class TTSSchema(BaseModel):
     text: str
@@ -1097,6 +1117,98 @@ def log_icon_tap(data: AACLogSchema, db: Session = Depends(get_db), current_user
     db.commit()
     return {"message": "Log saved"}
 
+# ─────────────────────────────────────────────
+# 12.6  COMMUNICATION REQUESTS
+# ─────────────────────────────────────────────
+
+@app.post("/api/requests/")
+def create_request(
+    data: RequestCreateSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.status != "STUDENT":
+        raise HTTPException(status_code=403, detail="Students only")
+
+    sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
+    if not sp:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+
+    session_id = None
+    if sp.instructor_id:
+        sess = db.query(ClassSession).filter_by(teacher_id=sp.instructor_id, is_active=True).first()
+        if sess:
+            session_id = sess.id
+
+    req = CommunicationRequest(
+        student_id   = sp.id,
+        session_id   = session_id,
+        request_type = data.request_type,
+        note         = data.note,
+        status       = "pending",
+        created_at   = dt.datetime.utcnow().isoformat(),
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    return {"message": "Request sent", "id": req.id}
+
+
+@app.get("/api/requests/active/")
+def get_active_requests(
+    since: int = 0,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.status != "TEACHER":
+        raise HTTPException(status_code=403, detail="Teachers only")
+    tp = current_user.teacher_profile
+    if not tp:
+        return []
+    student_ids = [s.id for s in tp.students]
+    if not student_ids:
+        return []
+
+    reqs = (
+        db.query(CommunicationRequest)
+        .filter(
+            CommunicationRequest.student_id.in_(student_ids),
+            CommunicationRequest.status != "resolved",
+            CommunicationRequest.id > since,
+        )
+        .order_by(CommunicationRequest.created_at.asc())
+        .all()
+    )
+    name_map = _build_student_name_map(db, [s.user_id for s in tp.students])
+    return [{
+        "id": r.id,
+        "student_id": r.student_id,
+        "request_type": r.request_type,
+        "status": r.status,
+        "note": r.note,
+        "created_at": r.created_at,
+    } for r in reqs]
+
+
+@app.patch("/api/requests/{request_id}/")
+def update_request_status(
+    request_id: int,
+    data: RequestStatusSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.status != "TEACHER":
+        raise HTTPException(status_code=403, detail="Teachers only")
+
+    req = db.query(CommunicationRequest).filter_by(id=request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    req.status = data.status
+    if data.status == "resolved":
+        req.resolved_at = dt.datetime.utcnow().isoformat()
+    db.commit()
+    return {"message": "Updated"}
 
 @app.post("/api/sessions/log/")
 def log_to_session(
