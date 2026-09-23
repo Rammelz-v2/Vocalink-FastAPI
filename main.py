@@ -1180,14 +1180,22 @@ def get_active_requests(
         .all()
     )
     name_map = _build_student_name_map(db, [s.user_id for s in tp.students])
-    return [{
-        "id": r.id,
-        "student_id": r.student_id,
-        "request_type": r.request_type,
-        "status": r.status,
-        "note": r.note,
-        "created_at": r.created_at,
-    } for r in reqs]
+    students_by_id = {s.id: s for s in tp.students}  # StudentProfile.id -> StudentProfile
+
+    result = []
+    for r in reqs:
+        sp = students_by_id.get(r.student_id)
+        student_name = name_map.get(sp.user_id) if sp else f"Student #{r.student_id}"
+        result.append({
+            "id": r.id,
+            "student_id": r.student_id,
+            "student_name": student_name,
+            "request_type": r.request_type,
+            "status": r.status,
+            "note": r.note,
+            "created_at": r.created_at,
+        })
+    return result
 
 
 @app.patch("/api/requests/{request_id}/")
