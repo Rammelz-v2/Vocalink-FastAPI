@@ -323,6 +323,9 @@ class SessionLogSchema(BaseModel):
     icon_id: str
     icon_label: str
 
+class JoinSessionSchema(BaseModel):
+    code: str
+
 # ─────────────────────────────────────────────
 # 4. HELPERS & DEPENDENCIES
 # ─────────────────────────────────────────────
@@ -710,6 +713,35 @@ def check_teacher_session(
     return {"active": False, "session_code": None}
 
 
+@app.post("/api/sessions/join/")
+def join_session(
+    data: JoinSessionSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Student enters a code to join a session — no roster assignment required."""
+    code = data.code.strip().upper()
+    sess = db.query(ClassSession).filter_by(session_code=code, is_active=True).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found or no longer active")
+
+    tp = db.query(TeacherProfile).filter_by(id=sess.teacher_id).first()
+    teacher_name = "Teacher"
+    if tp:
+        teacher_name = (
+            tp.display_name
+            or f"{tp.first_name} {tp.last_name}".strip()
+            or (tp.user.username if tp.user else "Teacher")
+        )
+
+    return {
+        "active": True,
+        "session_code": sess.session_code,
+        "teacher_name": teacher_name,
+        "session_id": sess.id,
+    }
+
+
 @app.get("/api/sessions/all/")
 def list_sessions(
     db: Session = Depends(get_db),
@@ -805,35 +837,48 @@ def get_session_log(
 
 @app.get("/api/sessions/student")
 def check_student_session(
+    session_code: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Student polls this every 5 s on home screen to detect when class starts.
-    Only returns a session if the student has been assigned to that teacher —
-    no more falling back to 'any active session'.
+    """Student polls this to check if a session is still active.
+    If session_code is provided (code-based join), look up by code directly.
+    Otherwise falls back to roster-based lookup via instructor_id.
     """
     if current_user.status != "STUDENT":
         return {"active": False}
+
+    if session_code:
+        # Code-based: just check if this specific session is still alive
+        sess = db.query(ClassSession).filter_by(session_code=session_code.upper(), is_active=True).first()
+        if not sess:
+            return {"active": False}
+        tp = db.query(TeacherProfile).filter_by(id=sess.teacher_id).first()
+        teacher_name = "Teacher"
+        if tp:
+            teacher_name = (
+                tp.display_name
+                or f"{tp.first_name} {tp.last_name}".strip()
+                or (tp.user.username if tp.user else "Teacher")
+            )
+        return {"active": True, "session_code": sess.session_code, "teacher_name": teacher_name}
+
+    # Roster-based fallback
     sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
     tid = sp.instructor_id if sp else None
     if not tid:
-        return {"active": False}  # not assigned to a teacher yet
-
+        return {"active": False}
     sess = db.query(ClassSession).filter_by(teacher_id=tid, is_active=True).first()
     if not sess:
         return {"active": False}
-
-    # Resolve teacher's display name so the frontend doesn't have to guess
-    # field names or fall back to a generic "Teacher" placeholder.
-    teacher_name = "Teacher"
     tp = db.query(TeacherProfile).filter_by(id=tid).first()
+    teacher_name = "Teacher"
     if tp:
         teacher_name = (
             tp.display_name
             or f"{tp.first_name} {tp.last_name}".strip()
             or (tp.user.username if tp.user else "Teacher")
         )
-
     return {"active": True, "session_code": sess.session_code, "teacher_name": teacher_name}
 
 
@@ -937,18 +982,26 @@ async def broadcast_audio(
 @app.get("/api/cc/messages/")
 def get_cc_messages(
     since: str = "",
+    session_code: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     if current_user.status == "STUDENT":
-        sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
-        tid = sp.instructor_id if sp else None
-        if not tid:
-            return []  # not assigned to a teacher — nothing to show
-
-        sess = db.query(ClassSession).filter_by(teacher_id=tid, is_active=True).first()
-        if not sess:
-            return []
+        if session_code:
+            # Code-based join: look up session directly by code
+            sess = db.query(ClassSession).filter_by(session_code=session_code.upper(), is_active=True).first()
+            if not sess:
+                return []
+            tid = sess.teacher_id
+        else:
+            # Roster-based fallback
+            sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
+            tid = sp.instructor_id if sp else None
+            if not tid:
+                return []
+            sess = db.query(ClassSession).filter_by(teacher_id=tid, is_active=True).first()
+            if not sess:
+                return []
 
         cc_q = db.query(CCMessage).filter(
             CCMessage.teacher_id == tid,
