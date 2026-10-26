@@ -1620,23 +1620,41 @@ def _auto_end_inactive_sessions():
         try:
             db = SessionLocal()
             try:
-                cutoff = (dt.datetime.utcnow() - dt.timedelta(minutes=10)).isoformat()
+                now    = dt.datetime.utcnow()
                 active = db.query(ClassSession).filter_by(is_active=True).all()
                 for sess in active:
-                    # Grace period: never end a session that only just started
-                    if sess.started_at and sess.started_at > cutoff:
+                    # Find the most recent activity for this session
+                    last_cc = (
+                        db.query(CCMessage.sent_at)
+                        .filter(CCMessage.session_id == sess.id)
+                        .order_by(CCMessage.sent_at.desc())
+                        .first()
+                    )
+                    last_aac = (
+                        db.query(AACLog.tapped_at)
+                        .filter(AACLog.session_id == sess.id)
+                        .order_by(AACLog.tapped_at.desc())
+                        .first()
+                    )
+                    # Use started_at as the baseline when there's no activity yet
+                    candidates = [sess.started_at] if sess.started_at else []
+                    if last_cc:  candidates.append(last_cc[0])
+                    if last_aac: candidates.append(last_aac[0])
+                    if not candidates:
                         continue
-                    has_cc  = db.query(CCMessage).filter(
-                        CCMessage.session_id == sess.id,
-                        CCMessage.sent_at    >  cutoff,
-                    ).first()
-                    has_aac = db.query(AACLog).filter(
-                        AACLog.session_id == sess.id,
-                        AACLog.tapped_at  >  cutoff,
-                    ).first()
-                    if not has_cc and not has_aac:
+
+                    last_activity = max(t for t in candidates if t)
+                    try:
+                        idle_seconds = (now - dt.datetime.fromisoformat(last_activity)).total_seconds()
+                    except Exception:
+                        continue
+
+                    if idle_seconds >= 600:  # 10 minutes of idle
                         sess.is_active = False
-                        print(f"[auto-end] session {sess.id} (code={sess.session_code}) ended — 10 min inactivity")
+                        print(
+                            f"[auto-end] session {sess.id} (code={sess.session_code}) "
+                            f"ended — idle {idle_seconds/60:.1f} min"
+                        )
                 db.commit()
             finally:
                 db.close()
