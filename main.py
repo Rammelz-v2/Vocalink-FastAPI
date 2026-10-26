@@ -1218,6 +1218,12 @@ def get_active_requests(
     tp = current_user.teacher_profile
     if not tp:
         return []
+
+    # Only surface requests from the currently active session
+    sess = db.query(ClassSession).filter_by(teacher_id=tp.id, is_active=True).first()
+    if not sess:
+        return []
+
     student_ids = [s.id for s in tp.students]
     if not student_ids:
         return []
@@ -1228,6 +1234,7 @@ def get_active_requests(
             CommunicationRequest.student_id.in_(student_ids),
             CommunicationRequest.status != "resolved",
             CommunicationRequest.id > since,
+            CommunicationRequest.session_id == sess.id,
         )
         .order_by(CommunicationRequest.created_at.asc())
         .all()
@@ -1596,3 +1603,45 @@ async def speech_to_text(
         return {"text": text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT error: {e}")
+
+
+# ─────────────────────────────────────────────
+# 15. AUTO-END INACTIVE SESSIONS
+# Runs in a background thread every 2 minutes.
+# Any session with no CCMessage and no AACLog in the last 10 minutes
+# (and that started more than 10 minutes ago) is automatically closed.
+# ─────────────────────────────────────────────
+
+import time as _time
+
+def _auto_end_inactive_sessions():
+    while True:
+        _time.sleep(120)  # check every 2 minutes
+        try:
+            db = SessionLocal()
+            try:
+                cutoff = (dt.datetime.utcnow() - dt.timedelta(minutes=10)).isoformat()
+                active = db.query(ClassSession).filter_by(is_active=True).all()
+                for sess in active:
+                    # Grace period: never end a session that only just started
+                    if sess.started_at and sess.started_at > cutoff:
+                        continue
+                    has_cc  = db.query(CCMessage).filter(
+                        CCMessage.session_id == sess.id,
+                        CCMessage.sent_at    >  cutoff,
+                    ).first()
+                    has_aac = db.query(AACLog).filter(
+                        AACLog.session_id == sess.id,
+                        AACLog.tapped_at  >  cutoff,
+                    ).first()
+                    if not has_cc and not has_aac:
+                        sess.is_active = False
+                        print(f"[auto-end] session {sess.id} (code={sess.session_code}) ended — 10 min inactivity")
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"[auto-end] error: {e}")
+
+_bg = threading.Thread(target=_auto_end_inactive_sessions, daemon=True)
+_bg.start()
