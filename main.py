@@ -309,13 +309,15 @@ class BroadcastSchema(BaseModel):
     speaker: str = "teacher"
 
 class AACLogSchema(BaseModel):
-    icon_id:    str
-    icon_label: str
-    message:    Optional[str] = None
+    icon_id:      str
+    icon_label:   str
+    message:      Optional[str] = None
+    session_code: Optional[str] = None
 
 class RequestCreateSchema(BaseModel):
     request_type: str
-    note: Optional[str] = None
+    note:         Optional[str] = None
+    session_code: Optional[str] = None
 
 class RequestStatusSchema(BaseModel):
     status: str
@@ -884,16 +886,13 @@ def get_session_log(
         .all()
     )
 
-    student_ids = [s.user_id for s in tp.students]
-    aac_logs = []
-    if student_ids:
-        aac_logs = (
-            db.query(AACLog)
-            .filter(AACLog.session_id == session_id, AACLog.user_id.in_(student_ids))
-            .order_by(AACLog.tapped_at.asc())
-            .all()
-        )
-
+    aac_logs = (
+        db.query(AACLog)
+        .filter(AACLog.session_id == session_id)
+        .order_by(AACLog.tapped_at.asc())
+        .all()
+    )
+    student_ids = list({l.user_id for l in aac_logs})
     name_map = _build_student_name_map(db, student_ids) if student_ids else {}
 
     entries = []
@@ -935,37 +934,17 @@ def check_student_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Student polls this to check if a session is still active.
-    If session_code is provided (code-based join), look up by code directly.
-    Otherwise falls back to roster-based lookup via instructor_id.
-    """
+    """Student polls this to check if a session is still active (code-based only)."""
     if current_user.status != "STUDENT":
         return {"active": False}
 
-    if session_code:
-        # Code-based: just check if this specific session is still alive
-        sess = db.query(ClassSession).filter_by(session_code=session_code.upper(), is_active=True).first()
-        if not sess:
-            return {"active": False}
-        tp = db.query(TeacherProfile).filter_by(id=sess.teacher_id).first()
-        teacher_name = "Teacher"
-        if tp:
-            teacher_name = (
-                tp.display_name
-                or f"{tp.first_name} {tp.last_name}".strip()
-                or (tp.user.username if tp.user else "Teacher")
-            )
-        return {"active": True, "session_code": sess.session_code, "teacher_name": teacher_name}
-
-    # Roster-based fallback
-    sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
-    tid = sp.instructor_id if sp else None
-    if not tid:
+    if not session_code:
         return {"active": False}
-    sess = db.query(ClassSession).filter_by(teacher_id=tid, is_active=True).first()
+
+    sess = db.query(ClassSession).filter_by(session_code=session_code.upper(), is_active=True).first()
     if not sess:
         return {"active": False}
-    tp = db.query(TeacherProfile).filter_by(id=tid).first()
+    tp = db.query(TeacherProfile).filter_by(id=sess.teacher_id).first()
     teacher_name = "Teacher"
     if tp:
         teacher_name = (
@@ -1081,52 +1060,21 @@ def get_cc_messages(
     current_user: User = Depends(get_current_user),
 ):
     if current_user.status == "STUDENT":
-        if session_code:
-            # Code-based join: look up session directly by code
-            sess = db.query(ClassSession).filter_by(session_code=session_code.upper(), is_active=True).first()
-            if not sess:
-                return []
-            tid = sess.teacher_id
-        else:
-            # Roster-based fallback
-            sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
-            tid = sp.instructor_id if sp else None
-            if not tid:
-                return []
-            sess = db.query(ClassSession).filter_by(teacher_id=tid, is_active=True).first()
-            if not sess:
-                return []
-
-        cc_q = db.query(CCMessage).filter(
-            CCMessage.teacher_id == tid,
-            CCMessage.session_id == sess.id,
-        )
-        # Include every classmate's taps (not just this student's own), so
-        # everyone sees the same shared feed. Falls back to just this
-        # student if there's no roster info yet.
-        classmate_ids = [
-            s.user_id for s in
-            db.query(StudentProfile).filter_by(instructor_id=tid).all()
-        ] or [current_user.id]
-        aac_q = db.query(AACLog).filter(
-            AACLog.session_id == sess.id,
-            AACLog.user_id.in_(classmate_ids),
-        )
+        if not session_code:
+            return []
+        sess = db.query(ClassSession).filter_by(session_code=session_code.upper(), is_active=True).first()
+        if not sess:
+            return []
+        cc_q  = db.query(CCMessage).filter(CCMessage.session_id == sess.id)
+        aac_q = db.query(AACLog).filter(AACLog.session_id == sess.id)
     else:
         # Teacher live-room: scope to current active session only
         tp = current_user.teacher_profile
         sess = db.query(ClassSession).filter_by(teacher_id=tp.id, is_active=True).first()
         if not sess:
             return []
-        cc_q = db.query(CCMessage).filter(
-            CCMessage.teacher_id == tp.id,
-            CCMessage.session_id == sess.id,
-        )
-        student_ids = [s.user_id for s in tp.students]
-        aac_q = (
-            db.query(AACLog).filter(AACLog.session_id == sess.id, AACLog.user_id.in_(student_ids))
-            if student_ids else db.query(AACLog).filter(AACLog.id < 0)  # empty result
-        )
+        cc_q  = db.query(CCMessage).filter(CCMessage.session_id == sess.id)
+        aac_q = db.query(AACLog).filter(AACLog.session_id == sess.id)
 
     if since:
         cc_q  = cc_q.filter(CCMessage.sent_at > since)
@@ -1247,12 +1195,12 @@ def remove_student(user_id: int, db: Session = Depends(get_db), current_user: Us
 @app.post("/api/logs/")
 def log_icon_tap(data: AACLogSchema, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     session_id = None
-    if current_user.status == "STUDENT":
-        sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
-        if sp and sp.instructor_id:
-            sess = db.query(ClassSession).filter_by(teacher_id=sp.instructor_id, is_active=True).first()
-            if sess:
-                session_id = sess.id
+    if current_user.status == "STUDENT" and data.session_code:
+        sess = db.query(ClassSession).filter_by(
+            session_code=data.session_code.upper(), is_active=True
+        ).first()
+        if sess:
+            session_id = sess.id
     db.add(AACLog(
         user_id    = current_user.id,
         session_id = session_id,
@@ -1282,8 +1230,10 @@ def create_request(
         raise HTTPException(status_code=404, detail="Student profile not found")
 
     session_id = None
-    if sp.instructor_id:
-        sess = db.query(ClassSession).filter_by(teacher_id=sp.instructor_id, is_active=True).first()
+    if data.session_code:
+        sess = db.query(ClassSession).filter_by(
+            session_code=data.session_code.upper(), is_active=True
+        ).first()
         if sess:
             session_id = sess.id
 
@@ -1318,28 +1268,26 @@ def get_active_requests(
     if not sess:
         return []
 
-    student_ids = [s.id for s in tp.students]
-    if not student_ids:
-        return []
-
     reqs = (
         db.query(CommunicationRequest)
         .filter(
-            CommunicationRequest.student_id.in_(student_ids),
-            CommunicationRequest.status != "resolved",
-            CommunicationRequest.id > since,
             CommunicationRequest.session_id == sess.id,
+            CommunicationRequest.status != "resolved",
         )
         .order_by(CommunicationRequest.created_at.asc())
         .all()
     )
-    name_map = _build_student_name_map(db, [s.user_id for s in tp.students])
-    students_by_id = {s.id: s for s in tp.students}  # StudentProfile.id -> StudentProfile
+
+    # Build name map from the actual requests' student profiles
+    sp_ids = list({r.student_id for r in reqs})
+    student_profiles = {sp.id: sp for sp in db.query(StudentProfile).filter(StudentProfile.id.in_(sp_ids)).all()} if sp_ids else {}
+    user_ids = [sp.user_id for sp in student_profiles.values()]
+    name_map = _build_student_name_map(db, user_ids) if user_ids else {}
 
     result = []
     for r in reqs:
-        sp = students_by_id.get(r.student_id)
-        student_name = name_map.get(sp.user_id) if sp else f"Student #{r.student_id}"
+        sp = student_profiles.get(r.student_id)
+        student_name = name_map.get(sp.user_id, f"Student #{r.student_id}") if sp else f"Student #{r.student_id}"
         result.append({
             "id": r.id,
             "student_id": r.student_id,
@@ -1378,22 +1326,11 @@ def log_to_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Called by the mobile AAC board when a student sends a built message
-    while a session is active. Verifies the session_code matches the
-    student's assigned teacher's *currently active* session before logging,
-    so a stale or mismatched code can't attribute a tap to the wrong class.
-    """
     if current_user.status != "STUDENT":
         raise HTTPException(status_code=403, detail="Students only")
 
-    sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
-    tid = sp.instructor_id if sp else None
-    if not tid:
-        raise HTTPException(status_code=403, detail="Not assigned to a teacher")
-
     sess = db.query(ClassSession).filter_by(
-        teacher_id=tid, session_code=data.session_code, is_active=True
+        session_code=data.session_code.upper(), is_active=True
     ).first()
     if not sess:
         raise HTTPException(status_code=400, detail="Session not found or no longer active")
@@ -1480,21 +1417,18 @@ def get_session_logs(
     sess = db.query(ClassSession).filter_by(teacher_id=tp.id, is_active=True).first()
     if not sess:
         return []
-    ids = [s.user_id for s in tp.students]
-    if not ids:
-        return []
     logs = (
         db.query(AACLog)
         .filter(
-            AACLog.user_id.in_(ids),
-            AACLog.tapped_at >= sess.started_at,
+            AACLog.session_id == sess.id,
             AACLog.id > since,
         )
         .order_by(AACLog.tapped_at.asc())
         .limit(200)
         .all()
     )
-    name_map = _build_student_name_map(db, ids)
+    ids = list({l.user_id for l in logs})
+    name_map = _build_student_name_map(db, ids) if ids else {}
     return [_format_log(l, name_map) for l in logs]
 
 
