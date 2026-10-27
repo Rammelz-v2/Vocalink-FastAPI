@@ -206,11 +206,13 @@ class SessionParticipant(Base):
     session_id = Column(Integer, ForeignKey("class_sessions.id", ondelete="CASCADE"))
     user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
     joined_at  = Column(String, default=lambda: dt.datetime.utcnow().isoformat())
+    left_at    = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
 # ── Safe auto-migrations for existing DBs ────────────────────────────────────
 _migrations = [
+    ("session_participants", "left_at VARCHAR"),
     ("communication_requests", "resolved_at VARCHAR"),
     ("users",            "is_verified INTEGER DEFAULT 0"),
     ("student_profiles", "last_seen VARCHAR"),
@@ -758,6 +760,23 @@ def join_session(
     }
 
 
+@app.post("/api/sessions/leave/")
+def leave_session(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Student explicitly leaves — marks left_at so they disappear from participants list."""
+    now = dt.datetime.utcnow().isoformat()
+    # Find any active session they're in and mark them as left
+    rows = db.query(SessionParticipant).filter_by(user_id=current_user.id).filter(
+        SessionParticipant.left_at.is_(None)
+    ).all()
+    for row in rows:
+        row.left_at = now
+    db.commit()
+    return {"ok": True}
+
+
 @app.get("/api/sessions/active/participants/")
 def get_active_participants(
     db: Session = Depends(get_db),
@@ -786,8 +805,10 @@ def get_active_participants(
         name = ((sp.first_name or "") + " " + (sp.last_name or "")).strip() if sp else ""
         return name or u.username or "Student"
 
-    # Source 1: explicit join records
-    for p in db.query(SessionParticipant).filter_by(session_id=sess.id).order_by(SessionParticipant.joined_at).all():
+    # Source 1: explicit join records (exclude students who have left)
+    for p in db.query(SessionParticipant).filter_by(session_id=sess.id).filter(
+        SessionParticipant.left_at.is_(None)
+    ).order_by(SessionParticipant.joined_at).all():
         u = db.query(User).filter_by(id=p.user_id).first()
         if not u:
             continue
