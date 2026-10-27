@@ -218,6 +218,10 @@ _migrations = [
     ("student_profiles", "last_seen VARCHAR"),
     ("teacher_profiles", "first_name VARCHAR DEFAULT ''"),
     ("teacher_profiles", "last_name VARCHAR DEFAULT ''"),
+    ("teacher_profiles", "display_name VARCHAR DEFAULT ''"),
+    ("teacher_profiles", "contact_number VARCHAR DEFAULT ''"),
+    ("teacher_profiles", "room_section VARCHAR DEFAULT ''"),
+    ("teacher_profiles", "department VARCHAR DEFAULT ''"),
     ("teacher_profiles", "grade_handled VARCHAR DEFAULT ''"),
     ("teacher_profiles", "organization VARCHAR DEFAULT ''"),
     ("teacher_profiles", "bio VARCHAR DEFAULT ''"),
@@ -639,19 +643,43 @@ def update_me(
     return {"message": "Profile updated"}
 
 
+class ChangePasswordSchema(BaseModel):
+    current_password: str
+    new_password:     str
+
+@app.post("/api/auth/change-password/")
+def change_password(
+    data: ChangePasswordSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not pwd_context.verify(data.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+    if len(data.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters.")
+    current_user.hashed_password = pwd_context.hash(data.new_password)
+    db.commit()
+    return {"message": "Password updated successfully."}
+
+
 @app.get("/api/users/me/")
 def get_me(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Web App.tsx fetches this to populate the sidebar teacher name."""
     if current_user.status == "TEACHER":
         p = current_user.teacher_profile
         return {
-            "id":           current_user.id,
-            "username":     current_user.username,
-            "email":        current_user.email,
-            "status":       current_user.status,
-            "display_name": p.display_name if p else "",
-            "first_name":   p.first_name   if p else "",
-            "last_name":    p.last_name    if p else "",
+            "id":             current_user.id,
+            "username":       current_user.username,
+            "email":          current_user.email,
+            "status":         current_user.status,
+            "display_name":   p.display_name   if p else "",
+            "first_name":     p.first_name     if p else "",
+            "last_name":      p.last_name      if p else "",
+            "contact_number": p.contact_number if p else "",
+            "room_section":   p.room_section   if p else "",
+            "department":     p.department     if p else "",
+            "grade_handled":  p.grade_handled  if p else "",
+            "organization":   p.organization   if p else "",
+            "bio":            p.bio            if p else "",
         }
     p = current_user.student_profile
     return {
@@ -746,13 +774,17 @@ def join_session(
             or (tp.user.username if tp.user else "Teacher")
         )
 
-    # Record participant (upsert — re-joining just updates nothing, one row per user+session)
+    # Record participant — create on first join, re-activate on rejoin
     existing = db.query(SessionParticipant).filter_by(
         session_id=sess.id, user_id=current_user.id
     ).first()
     if not existing:
         db.add(SessionParticipant(session_id=sess.id, user_id=current_user.id))
-        db.commit()
+    elif existing.left_at is not None:
+        # Student is rejoining after leaving — clear left_at so they reappear
+        existing.left_at  = None
+        existing.joined_at = dt.datetime.utcnow().isoformat()
+    db.commit()
 
     return {
         "active": True,
