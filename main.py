@@ -808,9 +808,12 @@ def get_active_participants(
         return name or u.username or "Student"
 
     # Source 1: explicit join records (exclude students who have left)
-    for p in db.query(SessionParticipant).filter_by(session_id=sess.id).filter(
-        SessionParticipant.left_at.is_(None)
-    ).order_by(SessionParticipant.joined_at).all():
+    all_participant_records = db.query(SessionParticipant).filter_by(session_id=sess.id).all()
+    explicitly_tracked_ids  = {p.user_id for p in all_participant_records}
+
+    for p in sorted(all_participant_records, key=lambda x: x.joined_at or ""):
+        if p.left_at is not None:
+            continue  # student called leave — exclude them
         u = db.query(User).filter_by(id=p.user_id).first()
         if not u:
             continue
@@ -821,9 +824,11 @@ def get_active_participants(
             "joined_at": p.joined_at,
         }
 
-    # Source 2: infer from AAC activity (catches students who joined before tracking was added)
+    # Source 2: infer from AAC activity ONLY for students with no explicit join record.
+    # Students who have a record (even a left one) are intentionally excluded — their
+    # join/leave state is already tracked; we must not re-add them from old log entries.
     for log in db.query(AACLog).filter_by(session_id=sess.id).order_by(AACLog.tapped_at).all():
-        if log.user_id in seen:
+        if log.user_id in seen or log.user_id in explicitly_tracked_ids:
             continue
         u = db.query(User).filter_by(id=log.user_id).first()
         if not u or u.status == "TEACHER":
