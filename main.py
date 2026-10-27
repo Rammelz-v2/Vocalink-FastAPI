@@ -199,6 +199,14 @@ class CommunicationRequest(Base):
 
     student = relationship("StudentProfile")
 
+
+class SessionParticipant(Base):
+    __tablename__ = "session_participants"
+    id         = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("class_sessions.id", ondelete="CASCADE"))
+    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    joined_at  = Column(String, default=lambda: dt.datetime.utcnow().isoformat())
+
 Base.metadata.create_all(bind=engine)
 
 # ── Safe auto-migrations for existing DBs ────────────────────────────────────
@@ -734,12 +742,77 @@ def join_session(
             or (tp.user.username if tp.user else "Teacher")
         )
 
+    # Record participant (upsert — re-joining just updates nothing, one row per user+session)
+    existing = db.query(SessionParticipant).filter_by(
+        session_id=sess.id, user_id=current_user.id
+    ).first()
+    if not existing:
+        db.add(SessionParticipant(session_id=sess.id, user_id=current_user.id))
+        db.commit()
+
     return {
         "active": True,
         "session_code": sess.session_code,
         "teacher_name": teacher_name,
         "session_id": sess.id,
     }
+
+
+@app.get("/api/sessions/active/participants/")
+def get_active_participants(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return students in the teacher's active session.
+
+    Merges two sources so retroactive/pre-tracking students still appear:
+    1. session_participants rows (explicit join via code)
+    2. aac_logs for this session (inferred — student was active even without explicit record)
+    Uses user_id as the stable 'id' so deduplication is consistent across sources.
+    """
+    if current_user.status != "TEACHER":
+        raise HTTPException(status_code=403, detail="Teachers only")
+    tp = current_user.teacher_profile
+    if not tp:
+        return []
+    sess = db.query(ClassSession).filter_by(teacher_id=tp.id, is_active=True).first()
+    if not sess:
+        return []
+
+    seen: dict = {}  # user_id → result row
+
+    def _name(u: User) -> str:
+        sp = getattr(u, "student_profile", None)
+        name = ((sp.first_name or "") + " " + (sp.last_name or "")).strip() if sp else ""
+        return name or u.username or "Student"
+
+    # Source 1: explicit join records
+    for p in db.query(SessionParticipant).filter_by(session_id=sess.id).order_by(SessionParticipant.joined_at).all():
+        u = db.query(User).filter_by(id=p.user_id).first()
+        if not u:
+            continue
+        seen[p.user_id] = {
+            "id":        p.user_id,
+            "user_id":   p.user_id,
+            "name":      _name(u),
+            "joined_at": p.joined_at,
+        }
+
+    # Source 2: infer from AAC activity (catches students who joined before tracking was added)
+    for log in db.query(AACLog).filter_by(session_id=sess.id).order_by(AACLog.tapped_at).all():
+        if log.user_id in seen:
+            continue
+        u = db.query(User).filter_by(id=log.user_id).first()
+        if not u or u.status == "TEACHER":
+            continue
+        seen[log.user_id] = {
+            "id":        log.user_id,
+            "user_id":   log.user_id,
+            "name":      _name(u),
+            "joined_at": log.tapped_at,
+        }
+
+    return sorted(seen.values(), key=lambda r: r["joined_at"])
 
 
 @app.get("/api/sessions/all/")
