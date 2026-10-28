@@ -161,6 +161,8 @@ class ClassSession(Base):
     session_code = Column(String)
     is_active    = Column(Boolean, default=True)
     started_at   = Column(String, default=lambda: dt.datetime.utcnow().isoformat())
+    ended_reason = Column(String, nullable=True)  # "manual" | "inactivity" | None
+    ended_at     = Column(String, nullable=True)
 
     teacher = relationship("TeacherProfile", back_populates="sessions")
 
@@ -229,6 +231,8 @@ _migrations = [
     ("class_sessions",   "is_active BOOLEAN DEFAULT 1"),
     ("cc_messages",      "session_id INTEGER"),
     ("aac_logs",         "session_id INTEGER"),
+    ("class_sessions",   "ended_reason VARCHAR"),
+    ("class_sessions",   "ended_at VARCHAR"),
 ]
 for _table, _col in _migrations:
     try:
@@ -719,7 +723,9 @@ def toggle_session(
 
     if active:
         # END the current session — mark it closed, keep its data
-        active.is_active = False
+        active.is_active    = False
+        active.ended_reason = "manual"
+        active.ended_at     = dt.datetime.utcnow().isoformat()
         db.commit()
         return {"active": False, "session_code": None}
     else:
@@ -895,7 +901,8 @@ def list_sessions(
     )
     return [
         {"id": s.id, "session_code": s.session_code,
-         "started_at": s.started_at, "is_active": s.is_active}
+         "started_at": s.started_at, "is_active": s.is_active,
+         "ended_reason": s.ended_reason}
         for s in sessions
     ]
 
@@ -960,7 +967,9 @@ def get_session_log(
         "session_id":   sess.id,
         "session_code": sess.session_code,
         "started_at":   sess.started_at,
+        "ended_at":     sess.ended_at,
         "is_active":    sess.is_active,
+        "ended_reason": sess.ended_reason,
         "entries":      entries,
     }
 
@@ -980,7 +989,14 @@ def check_student_session(
 
     sess = db.query(ClassSession).filter_by(session_code=session_code.upper(), is_active=True).first()
     if not sess:
-        return {"active": False}
+        # Session inactive — look up ended_reason so the student can show the right message
+        ended = (
+            db.query(ClassSession)
+            .filter_by(session_code=session_code.upper(), is_active=False)
+            .order_by(ClassSession.started_at.desc())
+            .first()
+        )
+        return {"active": False, "ended_reason": ended.ended_reason if ended else None}
     tp = db.query(TeacherProfile).filter_by(id=sess.teacher_id).first()
     teacher_name = "Teacher"
     if tp:
@@ -1715,7 +1731,9 @@ def _auto_end_inactive_sessions():
                         continue
 
                     if idle_seconds >= 600:  # 10 minutes of idle
-                        sess.is_active = False
+                        sess.is_active    = False
+                        sess.ended_reason = "inactivity"
+                        sess.ended_at     = dt.datetime.utcnow().isoformat()
                         print(
                             f"[auto-end] session {sess.id} (code={sess.session_code}) "
                             f"ended — idle {idle_seconds/60:.1f} min"
