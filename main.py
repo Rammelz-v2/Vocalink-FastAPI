@@ -215,6 +215,7 @@ Base.metadata.create_all(bind=engine)
 # ── Safe auto-migrations for existing DBs ────────────────────────────────────
 _migrations = [
     ("session_participants", "left_at VARCHAR"),
+    ("session_participants", "joined_at VARCHAR"),
     ("communication_requests", "resolved_at VARCHAR"),
     ("users",            "is_verified INTEGER DEFAULT 0"),
     ("student_profiles", "last_seen VARCHAR"),
@@ -936,8 +937,16 @@ def get_session_log(
         .order_by(AACLog.tapped_at.asc())
         .all()
     )
-    student_ids = list({l.user_id for l in aac_logs})
-    name_map = _build_student_name_map(db, student_ids) if student_ids else {}
+
+    participants = (
+        db.query(SessionParticipant)
+        .filter_by(session_id=session_id)
+        .order_by(SessionParticipant.joined_at.asc())
+        .all()
+    )
+
+    all_user_ids = list({l.user_id for l in aac_logs} | {p.user_id for p in participants})
+    name_map = _build_student_name_map(db, all_user_ids) if all_user_ids else {}
 
     entries = []
     for m in cc_msgs:
@@ -961,6 +970,29 @@ def get_session_log(
             "text":     l.message or l.icon_label,
             "icon_id":  l.icon_id,
         })
+    for p in participants:
+        ts = p.joined_at or ""
+        name = name_map.get(p.user_id, f"Student #{p.user_id}")
+        entries.append({
+            "type":       "event",
+            "id":         f"event-join-{p.user_id}-{ts}",
+            "sort_key":   ts,
+            "time":       ts[11:16] if len(ts) > 15 else ts,
+            "speaker":    "System",
+            "text":       f"{name} joined the session",
+            "event_kind": "join",
+        })
+        if p.left_at:
+            ts_left = p.left_at
+            entries.append({
+                "type":       "event",
+                "id":         f"event-leave-{p.user_id}-{ts_left}",
+                "sort_key":   ts_left,
+                "time":       ts_left[11:16] if len(ts_left) > 15 else ts_left,
+                "speaker":    "System",
+                "text":       f"{name} left the session",
+                "event_kind": "leave",
+            })
     entries.sort(key=lambda e: e["sort_key"])
 
     return {
@@ -1006,6 +1038,33 @@ def check_student_session(
             or (tp.user.username if tp.user else "Teacher")
         )
     return {"active": True, "session_code": sess.session_code, "teacher_name": teacher_name}
+
+
+@app.get("/api/sessions/student/current")
+def get_current_student_session(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns the active session the student is currently joined to, if any.
+    Used on app start / login to auto-restore session state."""
+    if current_user.status != "STUDENT":
+        return {"session_code": None, "active": False}
+
+    row = (
+        db.query(ClassSession)
+        .join(SessionParticipant, SessionParticipant.session_id == ClassSession.id)
+        .filter(
+            SessionParticipant.user_id == current_user.id,
+            SessionParticipant.left_at.is_(None),
+            ClassSession.is_active == True,
+        )
+        .first()
+    )
+
+    if not row:
+        return {"session_code": None, "active": False}
+
+    return {"session_code": row.session_code, "active": True}
 
 
 # ─────────────────────────────────────────────
