@@ -781,16 +781,13 @@ def join_session(
             or (tp.user.username if tp.user else "Teacher")
         )
 
-    # Record participant — create on first join, re-activate on rejoin
-    existing = db.query(SessionParticipant).filter_by(
+    # Create a new row for every join (including rejoins) so the full
+    # join/leave history is preserved in the session log.
+    active = db.query(SessionParticipant).filter_by(
         session_id=sess.id, user_id=current_user.id
-    ).first()
-    if not existing:
+    ).filter(SessionParticipant.left_at.is_(None)).first()
+    if not active:
         db.add(SessionParticipant(session_id=sess.id, user_id=current_user.id))
-    elif existing.left_at is not None:
-        # Student is rejoining after leaving — clear left_at so they reappear
-        existing.left_at  = None
-        existing.joined_at = dt.datetime.utcnow().isoformat()
     db.commit()
 
     return {
@@ -1776,10 +1773,17 @@ def _auto_end_inactive_sessions():
                         .order_by(AACLog.tapped_at.desc())
                         .first()
                     )
+                    last_join = (
+                        db.query(SessionParticipant.joined_at)
+                        .filter(SessionParticipant.session_id == sess.id)
+                        .order_by(SessionParticipant.joined_at.desc())
+                        .first()
+                    )
                     # Use started_at as the baseline when there's no activity yet
                     candidates = [sess.started_at] if sess.started_at else []
-                    if last_cc:  candidates.append(last_cc[0])
-                    if last_aac: candidates.append(last_aac[0])
+                    if last_cc:   candidates.append(last_cc[0])
+                    if last_aac:  candidates.append(last_aac[0])
+                    if last_join: candidates.append(last_join[0])
                     if not candidates:
                         continue
 
