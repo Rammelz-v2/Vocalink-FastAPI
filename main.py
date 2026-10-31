@@ -34,7 +34,7 @@ BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "olacomarkaidel@gmail.com")
 BREVO_SENDER_NAME  = "VocaLink"
 otp_store: dict    = {}
 
-HF_API_URL  = "https://api-inference.huggingface.co/models/rammealz123/VOCALink-Mobile-STT"
+HF_API_URL  = "https://api-inference.huggingface.co/models/openai/whisper-base"
 HF_TOKEN    = os.getenv("HUGGINGFACE_TOKEN")
 HF_HEADERS  = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
