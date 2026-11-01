@@ -186,6 +186,7 @@ class AACLog(Base):
     icon_id    = Column(String)
     icon_label = Column(String)
     message    = Column(String, nullable=True)
+    icon_sequence = Column(String, nullable=True)   # JSON list of icon_ids in a sent message (LSTM training data)
     tapped_at  = Column(String, default=lambda: dt.datetime.utcnow().isoformat())
 
 class CommunicationRequest(Base):
@@ -234,6 +235,7 @@ _migrations = [
     ("aac_logs",         "session_id INTEGER"),
     ("class_sessions",   "ended_reason VARCHAR"),
     ("class_sessions",   "ended_at VARCHAR"),
+    ("aac_logs",         "icon_sequence VARCHAR"),
 ]
 for _table, _col in _migrations:
     try:
@@ -322,6 +324,7 @@ class AACLogSchema(BaseModel):
     icon_label:   str
     message:      Optional[str] = None
     session_code: Optional[str] = None
+    icon_sequence: Optional[list[str]] = None   # icon_ids of a sent message, in tap order
 
 class RequestCreateSchema(BaseModel):
     request_type: str
@@ -1316,6 +1319,7 @@ def log_icon_tap(data: AACLogSchema, db: Session = Depends(get_db), current_user
         icon_id    = data.icon_id,
         icon_label = data.icon_label,
         message    = data.message,
+        icon_sequence = json.dumps(data.icon_sequence) if data.icon_sequence else None,
         tapped_at  = dt.datetime.utcnow().isoformat(),
     ))
     db.commit()
@@ -1542,16 +1546,25 @@ def get_session_logs(
 
 
 # ─────────────────────────────────────────────
-# 12.5  AAC Next-Icon Prediction (LSTM-style)
+# 12.5  AAC Next-Icon Prediction (LSTM)
 # ─────────────────────────────────────────────
 #
-# Sequence-based next-token prediction. Uses a learned bigram transition
-# distribution built from each user's AACLog history + a global prior for
-# cold-start. Mathematically equivalent to what a small LSTM trained on the
-# same data converges to for this vocabulary size (~25 icons), but cheap
-# enough to run on Render free tier.
+# A trained LSTM (lstm_model.py) reads the whole sequence tapped so far and
+# predicts the next icon. Weights come from train_lstm.py, which trains on
+# sent board messages (aac_logs.icon_sequence) plus a seed set of classroom
+# sentences. If the weights file is missing, the bigram heuristic below is
+# used as a fallback.
 
-# Hand-curated prior — common AAC phrase transitions for cold-start users
+_LSTM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lstm_weights.npz")
+try:
+    from lstm_model import NextIconLSTM
+    _LSTM = NextIconLSTM.load(_LSTM_PATH)
+    print(f"[LSTM] Loaded next-icon model ({len(_LSTM.vocab) - 1} icons)")
+except Exception as _e:
+    _LSTM = None
+    print(f"[LSTM] Model not loaded ({_e}); using bigram fallback")
+
+# Hand-curated prior — common AAC phrase transitions for cold-start users (fallback only)
 _PRIOR_TRANSITIONS = {
     "water":      [("please", 3), ("thankyou", 2), ("yes", 1)],
     "food":       [("please", 3), ("thankyou", 2), ("happy", 1)],
@@ -1595,14 +1608,23 @@ def predict_next_icon(
     current_user: User = Depends(get_current_user),
 ):
     """
-    LSTM-style next-icon prediction.
-    Returns the top-K most likely next icon_ids given the current sequence.
-    Combines:
+    Next-icon prediction. Returns the top-K most likely next icon_ids given
+    the current sequence, with the LSTM's probabilities as confidence.
+
+    Fallback when the LSTM isn't loaded — a bigram heuristic combining:
       1) Personal transition history from this user's AACLog (weight 2x)
       2) Global popularity prior from all users (weight 1x)
       3) Hand-curated linguistic prior for cold start (weight 0.5x)
     """
     top_k = max(1, min(data.top_k, 5))
+
+    if _LSTM is not None:
+        ranked = _LSTM.predict(data.sequence, top_k)
+        return {
+            "predictions": [i for i, _ in ranked],
+            "source": "lstm",
+            "confidence": [round(p, 3) for _, p in ranked],
+        }
 
     # Start of sequence → return defaults
     if not data.sequence:
@@ -1673,7 +1695,7 @@ def predict_next_icon(
     total  = sum(s for _, s in ranked) or 1.0
     return {
         "predictions": [i for i, _ in ranked],
-        "source": "lstm-bigram",
+        "source": "bigram-fallback",
         "confidence": [round(s / total, 3) for _, s in ranked],
     }
 
