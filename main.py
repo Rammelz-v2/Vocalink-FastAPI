@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Request
@@ -391,7 +391,7 @@ def _make_code(n: int = 6) -> str:
 # ─────────────────────────────────────────────
 
 @app.post("/api/auth/register/")
-def register(data: RegisterSchema, db: Session = Depends(get_db)):
+def register(data: RegisterSchema, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     if db.query(User).filter(
         (User.username == data.username) | (User.email == data.email)
     ).first():
@@ -431,7 +431,7 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[REGISTER OTP] {user.email} → {code}")
-    _send_otp_email_bg(user.email, code)
+    background_tasks.add_task(_send_otp_email, user.email, code)
 
     return {
         "message": "Account created! Please check your email for a verification code.",
@@ -480,12 +480,9 @@ def _send_otp_email(email: str, code: str) -> tuple[bool, str | None]:
     except Exception as e:
         return False, str(e)
 
-def _send_otp_email_bg(email: str, code: str):
-    """Fire-and-forget wrapper — runs in a daemon thread so it never blocks a request."""
-    threading.Thread(target=_send_otp_email, args=(email, code), daemon=True).start()
 
 @app.post("/api/auth/forgot-password/")
-def forgot_password(data: ResendOTPSchema, db: Session = Depends(get_db)):
+def forgot_password(data: ResendOTPSchema, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email).first()
     if not user:
         raise HTTPException(status_code=404, detail="No account found with that email.")
@@ -495,7 +492,7 @@ def forgot_password(data: ResendOTPSchema, db: Session = Depends(get_db)):
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[FORGOT PASSWORD OTP] {user.email} → {code}")
-    _send_otp_email_bg(user.email, code)
+    background_tasks.add_task(_send_otp_email, user.email, code)
     return {"message": "Reset code sent to your email."}
 
 
@@ -533,7 +530,7 @@ def reset_password(data: ResetPasswordSchema, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/resend-verification/")
-def resend_verification(data: ResendOTPSchema, db: Session = Depends(get_db)):
+def resend_verification(data: ResendOTPSchema, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     user = (
         db.query(User).filter(User.email == data.email).first() or
         db.query(User).filter(User.username == data.email).first()
@@ -546,7 +543,7 @@ def resend_verification(data: ResendOTPSchema, db: Session = Depends(get_db)):
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[RESEND VERIFICATION] {user.email} → {code}")
-    _send_otp_email_bg(user.email, code)
+    background_tasks.add_task(_send_otp_email, user.email, code)
     return {"message": "Verification code resent."}
 
 @app.post("/api/auth/verify-email/")
