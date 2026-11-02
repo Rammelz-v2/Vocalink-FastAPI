@@ -23,16 +23,19 @@ import random
 import string
 import threading
 import requests
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 # ─────────────────────────────────────────────
 # 1. CONFIG
 # ─────────────────────────────────────────────
-SECRET_KEY         = os.getenv("SECRET_KEY", "change-me-in-production")
-ALGORITHM          = "HS256"
-BREVO_API_KEY      = os.getenv("BREVO_API_KEY")
-BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "olacomarkaidel@gmail.com")
-BREVO_SENDER_NAME  = "VocaLink"
-otp_store: dict    = {}
+SECRET_KEY        = os.getenv("SECRET_KEY", "change-me-in-production")
+ALGORITHM         = "HS256"
+GMAIL_USER        = os.getenv("GMAIL_USER")
+GMAIL_APP_PASS    = os.getenv("GMAIL_APP_PASS")
+SENDER_NAME       = "VocaLink"
+otp_store: dict   = {}
 
 HF_API_URL  = "https://api-inference.huggingface.co/models/openai/whisper-base"
 HF_TOKEN    = os.getenv("HUGGINGFACE_TOKEN")
@@ -403,14 +406,12 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Password hashing failed: {str(e)}")
 
-    # Email verification is disabled — new accounts are verified immediately
-    # so they can log in right after signing up.
     user = User(
         username        = data.username,
         email           = str(data.email),
         hashed_password = hashed_pw,
         status          = data.status,
-        is_verified     = 1,
+        is_verified     = 0,
     )
     db.add(user)
     db.commit()
@@ -428,17 +429,27 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
         db.rollback()
         print(f"[register] profile warning: {e}")
 
+    code = str(random.randint(100000, 999999))
+    expires = dt.datetime.utcnow() + dt.timedelta(minutes=30)
+    db.query(OTPToken).filter(OTPToken.email == user.email).delete()
+    db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
+    db.commit()
+    print(f"[REGISTER OTP] {user.email} → {code}")
+    sent, error = _send_otp_email(user.email, code)
+
     return {
-        "message": "Account created! You can now sign in.",
+        "message": "Account created! Please check your email for a verification code.",
         "email": user.email,
+        "email_sent": sent,
+        "email_error": error,
     }
 
-@app.get("/api/auth/test-brevo/")
-def test_brevo():
-    sent, error = _send_otp_via_brevo(BREVO_SENDER_EMAIL, "123456")
+@app.get("/api/auth/test-email/")
+def test_email():
+    sent, error = _send_otp_email(GMAIL_USER or "", "123456")
     return {
-        "brevo_api_key_set": bool(BREVO_API_KEY),
-        "sender_email": BREVO_SENDER_EMAIL,
+        "gmail_configured": bool(GMAIL_USER and GMAIL_APP_PASS),
+        "sender_email": GMAIL_USER,
         "test_send": "ok" if sent else "failed",
         "test_error": error,
     }
@@ -446,32 +457,30 @@ def test_brevo():
 class ResendOTPSchema(BaseModel):
     email: str
 
-def _send_otp_via_brevo(email: str, code: str) -> tuple[bool, str | None]:
-    if not BREVO_API_KEY:
-        return False, "BREVO_API_KEY not set on server"
+def _send_otp_email(email: str, code: str) -> tuple[bool, str | None]:
+    if not GMAIL_USER or not GMAIL_APP_PASS:
+        return False, "GMAIL_USER or GMAIL_APP_PASS not set on server"
     try:
-        resp = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json", "accept": "application/json"},
-            json={
-                "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
-                "to": [{"email": email}],
-                "subject": "VocaLink — Your Verification Code",
-                "htmlContent": (
-                    "<div style='font-family:sans-serif;max-width:480px;margin:auto;"
-                    "padding:32px;background:#f9f9f9;border-radius:12px'>"
-                    "<h2 style='color:#1AADDC'>VocaLink Email Verification</h2>"
-                    "<p>Your verification code:</p>"
-                    f"<div style='font-size:40px;font-weight:800;letter-spacing:10px;"
-                    f"color:#1A1A2E;padding:20px 0;text-align:center'>{code}</div>"
-                    "<p style='color:#6B7280;font-size:13px'>Expires in <strong>30 minutes</strong>.</p></div>"
-                ),
-            },
-            timeout=10,
+        html = (
+            "<div style='font-family:sans-serif;max-width:480px;margin:auto;"
+            "padding:32px;background:#f9f9f9;border-radius:12px'>"
+            "<h2 style='color:#1AADDC'>VocaLink Email Verification</h2>"
+            "<p>Your verification code:</p>"
+            f"<div style='font-size:40px;font-weight:800;letter-spacing:10px;"
+            f"color:#1A1A2E;padding:20px 0;text-align:center'>{code}</div>"
+            "<p style='color:#6B7280;font-size:13px'>Expires in <strong>30 minutes</strong>.</p></div>"
         )
-        if resp.status_code in (200, 201):
-            return True, None
-        return False, f"Brevo {resp.status_code}: {resp.text}"
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "VocaLink — Your Verification Code"
+        msg["From"]    = f"{SENDER_NAME} <{GMAIL_USER}>"
+        msg["To"]      = email
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(GMAIL_USER, GMAIL_APP_PASS)
+            server.sendmail(GMAIL_USER, email, msg.as_string())
+        return True, None
     except Exception as e:
         return False, str(e)
 
@@ -486,7 +495,7 @@ def forgot_password(data: ResendOTPSchema, db: Session = Depends(get_db)):
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[FORGOT PASSWORD OTP] {user.email} → {code}")
-    sent, error = _send_otp_via_brevo(user.email, code)
+    sent, error = _send_otp_email(user.email, code)
     return {"message": "Reset code sent to your email.", "email_sent": sent, "email_error": error}
 
 
@@ -537,7 +546,7 @@ def resend_verification(data: ResendOTPSchema, db: Session = Depends(get_db)):
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[RESEND VERIFICATION] {user.email} → {code}")
-    sent, error = _send_otp_via_brevo(user.email, code)
+    sent, error = _send_otp_email(user.email, code)
     return {"message": "Verification code resent.", "email_sent": sent, "email_error": error}
 
 @app.post("/api/auth/verify-email/")
@@ -574,6 +583,8 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     ).first()
     if not user or not pwd_context.verify(data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.is_verified:
+        raise HTTPException(status_code=403, detail="EMAIL_NOT_VERIFIED")
     return {"access_token": create_access_token({"user_id": user.id}), "status": user.status}
 
 # ─────────────────────────────────────────────
