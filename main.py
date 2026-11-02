@@ -435,13 +435,11 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[REGISTER OTP] {user.email} → {code}")
-    sent, error = _send_otp_email(user.email, code)
+    _send_otp_email_bg(user.email, code)
 
     return {
         "message": "Account created! Please check your email for a verification code.",
         "email": user.email,
-        "email_sent": sent,
-        "email_error": error,
     }
 
 @app.get("/api/auth/test-email/")
@@ -475,7 +473,7 @@ def _send_otp_email(email: str, code: str) -> tuple[bool, str | None]:
         msg["From"]    = f"{SENDER_NAME} <{GMAIL_USER}>"
         msg["To"]      = email
         msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
             server.ehlo()
             server.starttls()
             server.login(GMAIL_USER, GMAIL_APP_PASS)
@@ -483,6 +481,10 @@ def _send_otp_email(email: str, code: str) -> tuple[bool, str | None]:
         return True, None
     except Exception as e:
         return False, str(e)
+
+def _send_otp_email_bg(email: str, code: str):
+    """Fire-and-forget wrapper — runs in a daemon thread so it never blocks a request."""
+    threading.Thread(target=_send_otp_email, args=(email, code), daemon=True).start()
 
 @app.post("/api/auth/forgot-password/")
 def forgot_password(data: ResendOTPSchema, db: Session = Depends(get_db)):
@@ -495,8 +497,8 @@ def forgot_password(data: ResendOTPSchema, db: Session = Depends(get_db)):
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[FORGOT PASSWORD OTP] {user.email} → {code}")
-    sent, error = _send_otp_email(user.email, code)
-    return {"message": "Reset code sent to your email.", "email_sent": sent, "email_error": error}
+    _send_otp_email_bg(user.email, code)
+    return {"message": "Reset code sent to your email."}
 
 
 class ResetPasswordSchema(BaseModel):
@@ -546,8 +548,8 @@ def resend_verification(data: ResendOTPSchema, db: Session = Depends(get_db)):
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[RESEND VERIFICATION] {user.email} → {code}")
-    sent, error = _send_otp_email(user.email, code)
-    return {"message": "Verification code resent.", "email_sent": sent, "email_error": error}
+    _send_otp_email_bg(user.email, code)
+    return {"message": "Verification code resent."}
 
 @app.post("/api/auth/verify-email/")
 def verify_email(data: VerifyEmailSchema, db: Session = Depends(get_db)):
