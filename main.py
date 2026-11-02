@@ -21,6 +21,7 @@ import io
 import json
 import random
 import string
+import threading
 import requests
 
 # ─────────────────────────────────────────────
@@ -334,10 +335,6 @@ class TTSSchema(BaseModel):
     text: str
 
 
-class VerifyEmailSchema(BaseModel):
-    email: str
-    code: str
-
 class SessionLogSchema(BaseModel):
     session_code: str
     icon_id: str
@@ -478,47 +475,6 @@ def reset_password(data: ResetPasswordSchema, db: Session = Depends(get_db)):
     return {"message": "Password reset successfully. You can now sign in."}
 
 
-@app.post("/api/auth/resend-verification/")
-def resend_verification(data: ResendOTPSchema, db: Session = Depends(get_db)):
-    user = (
-        db.query(User).filter(User.email == data.email).first() or
-        db.query(User).filter(User.username == data.email).first()
-    )
-    if not user:
-        raise HTTPException(status_code=404, detail="No account found with that email.")
-    code = str(random.randint(100000, 999999))
-    expires = dt.datetime.utcnow() + dt.timedelta(minutes=30)
-    db.query(OTPToken).filter(OTPToken.email == user.email).delete()
-    db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
-    db.commit()
-    print(f"[RESEND VERIFICATION] {user.email} → {code}")
-    return {"message": "Verification code resent."}
-
-@app.post("/api/auth/verify-email/")
-def verify_email(data: VerifyEmailSchema, db: Session = Depends(get_db)):
-    record = (
-        db.query(OTPToken)
-        .filter(OTPToken.email == data.email, OTPToken.used == False)
-        .order_by(OTPToken.id.desc())
-        .first()
-    )
-    if not record:
-        raise HTTPException(status_code=400, detail="No verification code found. Please tap 'Resend Code'.")
-    if dt.datetime.utcnow() > dt.datetime.fromisoformat(record.expires_at):
-        db.delete(record)
-        db.commit()
-        raise HTTPException(status_code=400, detail="Code expired. Please tap 'Resend Code'.")
-    if record.code != data.code:
-        raise HTTPException(status_code=400, detail="Invalid code.")
-
-    user = db.query(User).filter(User.email == data.email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
-
-    user.is_verified = 1
-    record.used = True
-    db.commit()
-    return {"message": "Email verified! You can now sign in."}
 
 
 @app.post("/api/auth/login/")
@@ -528,8 +484,6 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     ).first()
     if not user or not pwd_context.verify(data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    if not user.is_verified:
-        raise HTTPException(status_code=403, detail="EMAIL_NOT_VERIFIED")
     return {"access_token": create_access_token({"user_id": user.id}), "status": user.status}
 
 # ─────────────────────────────────────────────
