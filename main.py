@@ -23,17 +23,13 @@ import random
 import string
 import threading
 import requests
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 # ─────────────────────────────────────────────
 # 1. CONFIG
 # ─────────────────────────────────────────────
 SECRET_KEY        = os.getenv("SECRET_KEY", "change-me-in-production")
 ALGORITHM         = "HS256"
-GMAIL_USER        = os.getenv("GMAIL_USER")
-GMAIL_APP_PASS    = os.getenv("GMAIL_APP_PASS")
+RESEND_API_KEY    = os.getenv("RESEND_API_KEY")
 SENDER_NAME       = "VocaLink"
 otp_store: dict   = {}
 
@@ -444,10 +440,9 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
 
 @app.get("/api/auth/test-email/")
 def test_email():
-    sent, error = _send_otp_email(GMAIL_USER or "", "123456")
+    sent, error = _send_otp_email("admin.vocalink@gmail.com", "123456")
     return {
-        "gmail_configured": bool(GMAIL_USER and GMAIL_APP_PASS),
-        "sender_email": GMAIL_USER,
+        "resend_configured": bool(RESEND_API_KEY),
         "test_send": "ok" if sent else "failed",
         "test_error": error,
     }
@@ -456,8 +451,8 @@ class ResendOTPSchema(BaseModel):
     email: str
 
 def _send_otp_email(email: str, code: str) -> tuple[bool, str | None]:
-    if not GMAIL_USER or not GMAIL_APP_PASS:
-        return False, "GMAIL_USER or GMAIL_APP_PASS not set on server"
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY not set on server"
     try:
         html = (
             "<div style='font-family:sans-serif;max-width:480px;margin:auto;"
@@ -468,17 +463,20 @@ def _send_otp_email(email: str, code: str) -> tuple[bool, str | None]:
             f"color:#1A1A2E;padding:20px 0;text-align:center'>{code}</div>"
             "<p style='color:#6B7280;font-size:13px'>Expires in <strong>30 minutes</strong>.</p></div>"
         )
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "VocaLink — Your Verification Code"
-        msg["From"]    = f"{SENDER_NAME} <{GMAIL_USER}>"
-        msg["To"]      = email
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(GMAIL_USER, GMAIL_APP_PASS)
-            server.sendmail(GMAIL_USER, email, msg.as_string())
-        return True, None
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from": f"{SENDER_NAME} <onboarding@resend.dev>",
+                "to":      [email],
+                "subject": "VocaLink — Your Verification Code",
+                "html":    html,
+            },
+            timeout=10,
+        )
+        if resp.status_code in (200, 201):
+            return True, None
+        return False, f"Resend {resp.status_code}: {resp.text}"
     except Exception as e:
         return False, str(e)
 
