@@ -468,9 +468,9 @@ def _send_otp_email(email: str, code: str) -> tuple[bool, str | None]:
             headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
             json={
                 "from": f"{SENDER_NAME} <onboarding@resend.dev>",
-                "to":      [email],
-                "subject": "VocaLink — Your Verification Code",
-                "html":    html,
+                "to": [email],
+                "subject": "VocaLink - Your Verification Code",
+                "html": html,
             },
             timeout=10,
         )
