@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Request
@@ -21,7 +21,6 @@ import io
 import json
 import random
 import string
-import threading
 import requests
 
 # ─────────────────────────────────────────────
@@ -29,8 +28,6 @@ import requests
 # ─────────────────────────────────────────────
 SECRET_KEY        = os.getenv("SECRET_KEY", "change-me-in-production")
 ALGORITHM         = "HS256"
-RESEND_API_KEY    = os.getenv("RESEND_API_KEY")
-SENDER_NAME       = "VocaLink"
 otp_store: dict   = {}
 
 HF_API_URL  = "https://api-inference.huggingface.co/models/openai/whisper-base"
@@ -391,7 +388,7 @@ def _make_code(n: int = 6) -> str:
 # ─────────────────────────────────────────────
 
 @app.post("/api/auth/register/")
-def register(data: RegisterSchema, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def register(data: RegisterSchema, db: Session = Depends(get_db)):
     if db.query(User).filter(
         (User.username == data.username) | (User.email == data.email)
     ).first():
@@ -407,7 +404,7 @@ def register(data: RegisterSchema, background_tasks: BackgroundTasks, db: Sessio
         email           = str(data.email),
         hashed_password = hashed_pw,
         status          = data.status,
-        is_verified     = 0,
+        is_verified     = 1,
     )
     db.add(user)
     db.commit()
@@ -425,64 +422,17 @@ def register(data: RegisterSchema, background_tasks: BackgroundTasks, db: Sessio
         db.rollback()
         print(f"[register] profile warning: {e}")
 
-    code = str(random.randint(100000, 999999))
-    expires = dt.datetime.utcnow() + dt.timedelta(minutes=30)
-    db.query(OTPToken).filter(OTPToken.email == user.email).delete()
-    db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
-    db.commit()
-    print(f"[REGISTER OTP] {user.email} → {code}")
-    background_tasks.add_task(_send_otp_email, user.email, code)
-
     return {
-        "message": "Account created! Please check your email for a verification code.",
+        "message": "Account created! You can now sign in.",
         "email": user.email,
-    }
-
-@app.get("/api/auth/test-email/")
-def test_email():
-    sent, error = _send_otp_email("admin.vocalink@gmail.com", "123456")
-    return {
-        "resend_configured": bool(RESEND_API_KEY),
-        "test_send": "ok" if sent else "failed",
-        "test_error": error,
     }
 
 class ResendOTPSchema(BaseModel):
     email: str
 
-def _send_otp_email(email: str, code: str) -> tuple[bool, str | None]:
-    if not RESEND_API_KEY:
-        return False, "RESEND_API_KEY not set on server"
-    try:
-        html = (
-            "<div style='font-family:sans-serif;max-width:480px;margin:auto;"
-            "padding:32px;background:#f9f9f9;border-radius:12px'>"
-            "<h2 style='color:#1AADDC'>VocaLink Email Verification</h2>"
-            "<p>Your verification code:</p>"
-            f"<div style='font-size:40px;font-weight:800;letter-spacing:10px;"
-            f"color:#1A1A2E;padding:20px 0;text-align:center'>{code}</div>"
-            "<p style='color:#6B7280;font-size:13px'>Expires in <strong>30 minutes</strong>.</p></div>"
-        )
-        resp = requests.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "from": f"{SENDER_NAME} <onboarding@resend.dev>",
-                "to": [email],
-                "subject": "VocaLink - Your Verification Code",
-                "html": html,
-            },
-            timeout=10,
-        )
-        if resp.status_code in (200, 201):
-            return True, None
-        return False, f"Resend {resp.status_code}: {resp.text}"
-    except Exception as e:
-        return False, str(e)
-
 
 @app.post("/api/auth/forgot-password/")
-def forgot_password(data: ResendOTPSchema, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def forgot_password(data: ResendOTPSchema, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email).first()
     if not user:
         raise HTTPException(status_code=404, detail="No account found with that email.")
@@ -492,7 +442,6 @@ def forgot_password(data: ResendOTPSchema, background_tasks: BackgroundTasks, db
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[FORGOT PASSWORD OTP] {user.email} → {code}")
-    background_tasks.add_task(_send_otp_email, user.email, code)
     return {"message": "Reset code sent to your email."}
 
 
@@ -530,7 +479,7 @@ def reset_password(data: ResetPasswordSchema, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/resend-verification/")
-def resend_verification(data: ResendOTPSchema, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def resend_verification(data: ResendOTPSchema, db: Session = Depends(get_db)):
     user = (
         db.query(User).filter(User.email == data.email).first() or
         db.query(User).filter(User.username == data.email).first()
@@ -543,7 +492,6 @@ def resend_verification(data: ResendOTPSchema, background_tasks: BackgroundTasks
     db.add(OTPToken(email=user.email, code=code, expires_at=expires.isoformat()))
     db.commit()
     print(f"[RESEND VERIFICATION] {user.email} → {code}")
-    background_tasks.add_task(_send_otp_email, user.email, code)
     return {"message": "Verification code resent."}
 
 @app.post("/api/auth/verify-email/")
