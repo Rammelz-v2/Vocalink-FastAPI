@@ -1274,6 +1274,24 @@ def create_request(
     return {"message": "Request sent", "id": req.id}
 
 
+@app.get("/api/requests/{request_id}/status/")
+def get_request_status(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Student polls this to find out if the teacher acknowledged their request."""
+    if current_user.status != "STUDENT":
+        raise HTTPException(status_code=403, detail="Students only")
+    sp = db.query(StudentProfile).filter_by(user_id=current_user.id).first()
+    if not sp:
+        raise HTTPException(status_code=404, detail="Not found")
+    req = db.query(CommunicationRequest).filter_by(id=request_id, student_id=sp.id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"id": req.id, "status": req.status}
+
+
 @app.get("/api/requests/active/")
 def get_active_requests(
     since: int = 0,
